@@ -367,20 +367,17 @@ char *gen_hash(const char *seed) {
     if (!hash_str) return NULL;
 
     if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-        fprintf(stderr, "Error CryptAcquireContext. Error: %x\n", GetLastError());
         free(hash_str);
         return NULL;
     }
 
     if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-        fprintf(stderr, "Error CryptCreateHash. Error: %x\n", GetLastError());
         CryptReleaseContext(hProv, 0);
         free(hash_str);
         return NULL;
     }
 
     if (!CryptHashData(hHash, (const BYTE *)seed, (DWORD)strlen(seed), 0)) {
-        fprintf(stderr, "Error CryptHashData. Error: %x\n", GetLastError());
         CryptDestroyHash(hHash);
         CryptReleaseContext(hProv, 0);
         free(hash_str);
@@ -388,7 +385,6 @@ char *gen_hash(const char *seed) {
     }
 
     if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-        fprintf(stderr, "Error CryptGetHashParam. Error: %x\n", GetLastError());
         CryptDestroyHash(hHash);
         CryptReleaseContext(hProv, 0);
         free(hash_str);
@@ -471,7 +467,6 @@ int createThread(struct Thread *thread) {
     );
 
     if (thread->thread == 0) {
-        fprintf(stderr, "Error creando hilo\n");
         return -1;
     }
     return 0;
@@ -553,7 +548,6 @@ int main(int argc, char *argv[]) {
 
     file = fopen(filename, "r");
     if (file == NULL) {
-        fprintf(stderr, "Error abriendo archivo %s\n", filename);
         return 1;
     }
     if (threads_amount > MAX_HILOS) threads_amount = MAX_HILOS; 
