@@ -266,8 +266,9 @@ int main(int argc, char *argv[]) {
 #elif _WIN32
 
 /*
- * File:    cracker_windows_final.c
- * Autor:   Adaptado para corregir errores de compilación y rendimiento
+ * File:    cracker_universal.c
+ * Autor:   Versión FINAL Robusta (Thread-Local Context)
+ * Descripción: Funciona en Dev-C++, VS Code y CMD sin congelarse.
  */
 
 #define _CRT_SECURE_NO_WARNINGS 
@@ -277,7 +278,6 @@ int main(int argc, char *argv[]) {
 #include <stdlib.h>
 #include <string.h>
 
-// Enlace automático con la librería necesaria
 #pragma comment(lib, "advapi32.lib")
 
 #define MAX_USUARIOS 50
@@ -285,10 +285,7 @@ int main(int argc, char *argv[]) {
 #define MAX_PASSWORD_LENGHT 4
 #define MD5_DIGEST_LENGTH 16
 
-// --- VARIABLE GLOBAL PARA RENDIMIENTO ---
-// El contexto criptográfico es thread-safe en Windows, 
-// así que lo abrimos una vez globalmente para no abrirlo millones de veces.
-HCRYPTPROV hGlobalProv = 0; 
+// YA NO usamos variable global para HCRYPTPROV para evitar bloqueos en VS Code.
 
 struct ThreadData {
     int id;
@@ -302,11 +299,13 @@ struct Account {
     char *hashed_password;
 };
 
+// --- PROTOTIPOS ACTUALIZADOS ---
+// Ahora gen_hash y decrypt reciben el hProv como argumento
 struct Account read_next_account();
 void setMemAccount(struct Account *account);
 void freeAccount(struct Account *account);
-char *gen_hash(const char *seed);
-int decrypt(struct Account *account);
+char *gen_hash(const char *seed, HCRYPTPROV hProv); 
+int decrypt(struct Account *account, HCRYPTPROV hProv);
 static DWORD WINAPI thread_function(LPVOID arg);
 
 FILE *file = NULL;
@@ -363,8 +362,8 @@ void setMemAccount(struct Account *account) {
     if(account->hashed_password) memset(account->hashed_password, '\0', 32 + 1);
 }
 
-// --- HASH OPTIMIZADO ---
-char *gen_hash(const char *seed) {
+// --- HASH (Recibe hProv para evitar conflictos) ---
+char *gen_hash(const char *seed, HCRYPTPROV hProv) {
     HCRYPTHASH hHash = 0;
     BYTE rgbHash[MD5_DIGEST_LENGTH];
     DWORD cbHash = MD5_DIGEST_LENGTH;
@@ -372,12 +371,11 @@ char *gen_hash(const char *seed) {
     
     if (!hash_str) return NULL;
 
-    // Usamos el proveedor global hGlobalProv en lugar de abrir uno nuevo
-    if (!CryptCreateHash(hGlobalProv, CALG_MD5, 0, 0, &hHash)) {
+    // Usamos el proveedor que nos pasa el hilo (Thread Local)
+    if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
         free(hash_str); return NULL;
     }
 
-    // CORRECCIÓN PARA VS CODE: Quitamos 'const' del cast
     if (!CryptHashData(hHash, (BYTE *)seed, (DWORD)strlen(seed), 0)) {
         CryptDestroyHash(hHash); free(hash_str); return NULL;
     }
@@ -391,7 +389,6 @@ char *gen_hash(const char *seed) {
     }
 
     CryptDestroyHash(hHash);
-    // Nota: NO liberamos hGlobalProv aquí, se libera en main
     return hash_str;
 }
 
@@ -410,15 +407,19 @@ int setNextCombination(char *combination) {
     return 1;
 }
 
-int decrypt(struct Account *account) {
+// --- DECRYPT (Ahora recibe hProv) ---
+int decrypt(struct Account *account, HCRYPTPROV hProv) {
     char *combination = (char *)malloc(sizeof(char[MAX_PASSWORD_LENGHT + 1]));
     memset(combination, '\0', MAX_PASSWORD_LENGHT + 1);
     int found = 1;
 
     while (setNextCombination(combination) == 0) {
-        char *hash = gen_hash(combination);
+        // Pasamos hProv a gen_hash
+        char *hash = gen_hash(combination, hProv);
+        
         if (hash == NULL) break;
         if (strcmp(account->hashed_password, hash) != 0) { free(hash); continue; }
+        
         free(hash); found = 0; break;
     }
     if (found == 0) memcpy(account->password, combination, strlen(combination));
@@ -426,8 +427,17 @@ int decrypt(struct Account *account) {
     return found;
 }
 
+// --- HILO ---
 static DWORD WINAPI thread_function(LPVOID arg) {
     struct ThreadData *data = (struct ThreadData *)arg;
+    HCRYPTPROV hThreadProv = 0;
+
+    // 1. Cada hilo inicializa SU PROPIA instancia de criptografía.
+    // Esto evita colisiones entre hilos (que causaban el freeze en VS Code).
+    if (!CryptAcquireContext(&hThreadProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        fprintf(stderr, "Error CryptAcquireContext hilo %d\n", data->id);
+        return 1;
+    }
 
     while (1) {
         WaitForSingleObject(data->semaphore, INFINITE);
@@ -437,22 +447,29 @@ static DWORD WINAPI thread_function(LPVOID arg) {
         if (account.user == NULL) {
             ReleaseSemaphore(data->next_semaphore, 1, NULL); 
             freeAccount(&account);
+            
+            // Liberar el contexto antes de morir
+            CryptReleaseContext(hThreadProv, 0);
             return 0; 
         }
 
         ReleaseSemaphore(data->next_semaphore, 1, NULL);
 
-        decrypt(&account);
+        // Pasamos el contexto local a la función decrypt
+        decrypt(&account, hThreadProv);
         
         fprintf(stdout, "%-16s %-4s (Hilo ID: %d)\n", account.user, account.password, data->id);
+        fflush(stdout); // FORZAMOS que se escriba en pantalla inmediatamente
         
         freeAccount(&account);
     }
+    
+    CryptReleaseContext(hThreadProv, 0);
     return 0;
 }
 
 int main(int argc, char *argv[]) {
-    // Forzar salida inmediata en la consola (evita sensación de que se cuelga)
+    // Optimización de salida
     setbuf(stdout, NULL);
 
     const char* filename = "./users.txt"; 
@@ -469,18 +486,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // --- INICIALIZAR CRYPTO PROVIDER (UNA SOLA VEZ) ---
-    if (!CryptAcquireContext(&hGlobalProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-        fprintf(stderr, "Error inicializando Wincrypt. Codigo: %x\n", GetLastError());
-        fclose(file);
-        return EXIT_FAILURE;
-    }
-
     HANDLE *hilos = (HANDLE *)malloc(sizeof(HANDLE) * threads_amount);
     struct ThreadData *datos_hilos = (struct ThreadData *)malloc(sizeof(struct ThreadData) * threads_amount);
     DWORD threadId;
 
-    printf("=== Iniciando Cracker (Windows API Optimizado) ===\n");
+    printf("=== Iniciando Cracker (Version Universal) ===\n");
     printf("PID del proceso: %lu\n", (unsigned long)GetCurrentProcessId());
     printf("[Main] Esperando a que terminen los hilos...\n");
 
@@ -514,9 +524,6 @@ int main(int argc, char *argv[]) {
         CloseHandle(hilos[i]);
         CloseHandle(datos_hilos[i].semaphore);
     }
-
-    // Liberar proveedor criptográfico
-    if (hGlobalProv) CryptReleaseContext(hGlobalProv, 0);
 
     free(hilos);
     free(datos_hilos);
