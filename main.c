@@ -265,6 +265,11 @@ int main(int argc, char *argv[]) {
 }
 #elif _WIN32
 
+/*
+ * File:    cracker_windows_final.c
+ * Autor:   Adaptado para corregir errores de compilación y rendimiento
+ */
+
 #define _CRT_SECURE_NO_WARNINGS 
 #include <windows.h>
 #include <wincrypt.h> 
@@ -272,19 +277,23 @@ int main(int argc, char *argv[]) {
 #include <stdlib.h>
 #include <string.h>
 
-// Enlace automático con la librería de criptografía y sistema
+// Enlace automático con la librería necesaria
 #pragma comment(lib, "advapi32.lib")
 
 #define MAX_USUARIOS 50
-#define MAX_HILOS 64 // WaitForMultipleObjects soporta hasta 64 objetos
+#define MAX_HILOS 64 
 #define MAX_PASSWORD_LENGHT 4
 #define MD5_DIGEST_LENGTH 16
 
-// Estructura de argumentos para el hilo (similar a HiloArgs del ejemplo)
+// --- VARIABLE GLOBAL PARA RENDIMIENTO ---
+// El contexto criptográfico es thread-safe en Windows, 
+// así que lo abrimos una vez globalmente para no abrirlo millones de veces.
+HCRYPTPROV hGlobalProv = 0; 
+
 struct ThreadData {
     int id;
-    HANDLE semaphore;      // Semáforo propio
-    HANDLE next_semaphore; // Semáforo del siguiente hilo
+    HANDLE semaphore;     
+    HANDLE next_semaphore; 
 };
 
 struct Account {
@@ -293,19 +302,16 @@ struct Account {
     char *hashed_password;
 };
 
-// --- Prototipos ---
 struct Account read_next_account();
 void setMemAccount(struct Account *account);
 void freeAccount(struct Account *account);
 char *gen_hash(const char *seed);
 int decrypt(struct Account *account);
-
-// Prototipo ajustado al estilo WinAPI
 static DWORD WINAPI thread_function(LPVOID arg);
 
 FILE *file = NULL;
 
-// --- Funciones Auxiliares (Lógica del programa) ---
+// --- FUNCIONES ---
 
 struct Account read_next_account() {
     struct Account account = {NULL, NULL, NULL};
@@ -357,9 +363,8 @@ void setMemAccount(struct Account *account) {
     if(account->hashed_password) memset(account->hashed_password, '\0', 32 + 1);
 }
 
-// Implementación de Hash usando WinCrypt
+// --- HASH OPTIMIZADO ---
 char *gen_hash(const char *seed) {
-    HCRYPTPROV hProv = 0;
     HCRYPTHASH hHash = 0;
     BYTE rgbHash[MD5_DIGEST_LENGTH];
     DWORD cbHash = MD5_DIGEST_LENGTH;
@@ -367,17 +372,18 @@ char *gen_hash(const char *seed) {
     
     if (!hash_str) return NULL;
 
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+    // Usamos el proveedor global hGlobalProv en lugar de abrir uno nuevo
+    if (!CryptCreateHash(hGlobalProv, CALG_MD5, 0, 0, &hHash)) {
         free(hash_str); return NULL;
     }
-    if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-        CryptReleaseContext(hProv, 0); free(hash_str); return NULL;
+
+    // CORRECCIÓN PARA VS CODE: Quitamos 'const' del cast
+    if (!CryptHashData(hHash, (BYTE *)seed, (DWORD)strlen(seed), 0)) {
+        CryptDestroyHash(hHash); free(hash_str); return NULL;
     }
-    if (!CryptHashData(hHash, (const BYTE *)seed, (DWORD)strlen(seed), 0)) {
-        CryptDestroyHash(hHash); CryptReleaseContext(hProv, 0); free(hash_str); return NULL;
-    }
+
     if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-        CryptDestroyHash(hHash); CryptReleaseContext(hProv, 0); free(hash_str); return NULL;
+        CryptDestroyHash(hHash); free(hash_str); return NULL;
     }
 
     for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
@@ -385,7 +391,7 @@ char *gen_hash(const char *seed) {
     }
 
     CryptDestroyHash(hHash);
-    CryptReleaseContext(hProv, 0);
+    // Nota: NO liberamos hGlobalProv aquí, se libera en main
     return hash_str;
 }
 
@@ -420,40 +426,35 @@ int decrypt(struct Account *account) {
     return found;
 }
 
-// --- Función del Hilo (Estilo Windows) ---
 static DWORD WINAPI thread_function(LPVOID arg) {
     struct ThreadData *data = (struct ThreadData *)arg;
 
     while (1) {
-        // Esperar turno (semáforo)
         WaitForSingleObject(data->semaphore, INFINITE);
 
         struct Account account = read_next_account();
         
-        // Si no hay más cuentas, avisar al siguiente y salir
         if (account.user == NULL) {
             ReleaseSemaphore(data->next_semaphore, 1, NULL); 
             freeAccount(&account);
-            return 0; // En Windows threads se retorna 0 (EXIT_SUCCESS)
+            return 0; 
         }
 
-        // Liberar el siguiente hilo para que lea mientras este procesa
         ReleaseSemaphore(data->next_semaphore, 1, NULL);
 
         decrypt(&account);
         
-        // fprintf es thread-safe en CRT moderno, pero printf a veces se mezcla.
-        // Usamos un bloque simple.
         fprintf(stdout, "%-16s %-4s (Hilo ID: %d)\n", account.user, account.password, data->id);
         
         freeAccount(&account);
     }
-
     return 0;
 }
 
-// --- MAIN ---
 int main(int argc, char *argv[]) {
+    // Forzar salida inmediata en la consola (evita sensación de que se cuelga)
+    setbuf(stdout, NULL);
+
     const char* filename = "./users.txt"; 
     int threads_amount = 6;
 
@@ -468,76 +469,55 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // --- Adaptación al Estilo del Profesor ---
-    
-    // 1. Definir arreglos de Handles y Argumentos
+    // --- INICIALIZAR CRYPTO PROVIDER (UNA SOLA VEZ) ---
+    if (!CryptAcquireContext(&hGlobalProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        fprintf(stderr, "Error inicializando Wincrypt. Codigo: %x\n", GetLastError());
+        fclose(file);
+        return EXIT_FAILURE;
+    }
+
     HANDLE *hilos = (HANDLE *)malloc(sizeof(HANDLE) * threads_amount);
     struct ThreadData *datos_hilos = (struct ThreadData *)malloc(sizeof(struct ThreadData) * threads_amount);
     DWORD threadId;
 
-    printf("=== Iniciando Cracker (Windows API) ===\n");
+    printf("=== Iniciando Cracker (Windows API Optimizado) ===\n");
     printf("PID del proceso: %lu\n", (unsigned long)GetCurrentProcessId());
+    printf("[Main] Esperando a que terminen los hilos...\n");
 
-    // 2. Inicializar semáforos y estructura de datos (Paso previo necesario por la lógica de anillo)
     for (int i = 0; i < threads_amount; i++) {
         datos_hilos[i].id = i + 1;
         datos_hilos[i].semaphore = CreateSemaphore(NULL, 0, 1, NULL);
-        if (datos_hilos[i].semaphore == NULL) {
-            fprintf(stderr, "Error creando semaforo %d\n", i);
-            return EXIT_FAILURE;
-        }
     }
-    // Enlazar semáforos (Anillo)
+    
     for (int i = 0; i < threads_amount; i++) {
         datos_hilos[i].next_semaphore = (i != threads_amount - 1) ? 
             datos_hilos[i + 1].semaphore : 
             datos_hilos[0].semaphore;
     }
 
-    // 3. Crear los hilos usando CreateThread
     for (int i = 0; i < threads_amount; i++) {
-        hilos[i] = CreateThread(
-            NULL,                   // Seguridad
-            0,                      // Stack size
-            thread_function,        // Función
-            &datos_hilos[i],        // Argumento (LPVOID)
-            0,                      // Flags
-            &threadId               // ID (opcional)
-        );
-
+        hilos[i] = CreateThread(NULL, 0, thread_function, &datos_hilos[i], 0, &threadId);
         if (hilos[i] == NULL) {
-            fprintf(stderr, "Error al crear el hilo %d (GetLastError = %lu).\n", i, (unsigned long)GetLastError());
+            fprintf(stderr, "Error creando hilo %d\n", i);
             exit(EXIT_FAILURE);
         }
     }
 
-    // Liberar el primer semáforo para iniciar la cadena
     ReleaseSemaphore(datos_hilos[0].semaphore, 1, NULL);
 
-    // 4. Esperar a que TODOS los hilos terminen (WaitForMultipleObjects)
-    //    Esta es la clave del ejemplo del profesor.
-    printf("[Main] Esperando a que terminen los hilos...\n");
-    
-    DWORD waitResult = WaitForMultipleObjects(
-        threads_amount, // Cantidad
-        hilos,          // Array de Handles
-        TRUE,           // WaitAll = TRUE (esperar a todos)
-        INFINITE        // Timeout
-    );
+    WaitForMultipleObjects(threads_amount, hilos, TRUE, INFINITE);
 
-    if (waitResult >= WAIT_OBJECT_0 && waitResult < WAIT_OBJECT_0 + threads_amount) {
-        printf("[Main] Todos los hilos han terminado correctamente.\n");
-    } else {
-        fprintf(stderr, "Error en WaitForMultipleObjects: %lu\n", GetLastError());
-    }
+    printf("\n[Main] Todos los hilos han terminado.\n");
 
-    // 5. Cerrar Handles (Limpieza)
+    // Limpieza
     for (int i = 0; i < threads_amount; i++) {
-        CloseHandle(hilos[i]);                // Cerrar Handle del hilo
-        CloseHandle(datos_hilos[i].semaphore);// Cerrar Handle del semáforo
+        CloseHandle(hilos[i]);
+        CloseHandle(datos_hilos[i].semaphore);
     }
 
-    // Liberar memoria dinámica general
+    // Liberar proveedor criptográfico
+    if (hGlobalProv) CryptReleaseContext(hGlobalProv, 0);
+
     free(hilos);
     free(datos_hilos);
     fclose(file);
