@@ -265,12 +265,6 @@ int main(int argc, char *argv[]) {
 }
 #elif _WIN32
 
-/*
- * File:    cracker_universal.c
- * Autor:   Versión FINAL Robusta (Thread-Local Context)
- * Descripción: Funciona en Dev-C++, VS Code y CMD sin congelarse.
- */
-
 #define _CRT_SECURE_NO_WARNINGS 
 #include <windows.h>
 #include <wincrypt.h> 
@@ -285,8 +279,6 @@ int main(int argc, char *argv[]) {
 #define MAX_PASSWORD_LENGHT 4
 #define MD5_DIGEST_LENGTH 16
 
-// YA NO usamos variable global para HCRYPTPROV para evitar bloqueos en VS Code.
-
 struct ThreadData {
     int id;
     HANDLE semaphore;     
@@ -299,8 +291,6 @@ struct Account {
     char *hashed_password;
 };
 
-// --- PROTOTIPOS ACTUALIZADOS ---
-// Ahora gen_hash y decrypt reciben el hProv como argumento
 struct Account read_next_account();
 void setMemAccount(struct Account *account);
 void freeAccount(struct Account *account);
@@ -309,8 +299,6 @@ int decrypt(struct Account *account, HCRYPTPROV hProv);
 static DWORD WINAPI thread_function(LPVOID arg);
 
 FILE *file = NULL;
-
-// --- FUNCIONES ---
 
 struct Account read_next_account() {
     struct Account account = {NULL, NULL, NULL};
@@ -407,14 +395,12 @@ int setNextCombination(char *combination) {
     return 1;
 }
 
-// --- DECRYPT (Ahora recibe hProv) ---
 int decrypt(struct Account *account, HCRYPTPROV hProv) {
     char *combination = (char *)malloc(sizeof(char[MAX_PASSWORD_LENGHT + 1]));
     memset(combination, '\0', MAX_PASSWORD_LENGHT + 1);
     int found = 1;
 
     while (setNextCombination(combination) == 0) {
-        // Pasamos hProv a gen_hash
         char *hash = gen_hash(combination, hProv);
         
         if (hash == NULL) break;
@@ -427,15 +413,11 @@ int decrypt(struct Account *account, HCRYPTPROV hProv) {
     return found;
 }
 
-// --- HILO ---
 static DWORD WINAPI thread_function(LPVOID arg) {
     struct ThreadData *data = (struct ThreadData *)arg;
     HCRYPTPROV hThreadProv = 0;
 
-    // 1. Cada hilo inicializa SU PROPIA instancia de criptografía.
-    // Esto evita colisiones entre hilos (que causaban el freeze en VS Code).
     if (!CryptAcquireContext(&hThreadProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-        fprintf(stderr, "Error CryptAcquireContext hilo %d\n", data->id);
         return 1;
     }
 
@@ -448,18 +430,16 @@ static DWORD WINAPI thread_function(LPVOID arg) {
             ReleaseSemaphore(data->next_semaphore, 1, NULL); 
             freeAccount(&account);
             
-            // Liberar el contexto antes de morir
             CryptReleaseContext(hThreadProv, 0);
             return 0; 
         }
 
         ReleaseSemaphore(data->next_semaphore, 1, NULL);
 
-        // Pasamos el contexto local a la función decrypt
         decrypt(&account, hThreadProv);
         
-        fprintf(stdout, "%-16s %-4s (Hilo ID: %d)\n", account.user, account.password, data->id);
-        fflush(stdout); // FORZAMOS que se escriba en pantalla inmediatamente
+        fprintf(stdout, "%-16s\t%-4s\n", account.user, account.password);
+        fflush(stdout);
         
         freeAccount(&account);
     }
@@ -469,7 +449,6 @@ static DWORD WINAPI thread_function(LPVOID arg) {
 }
 
 int main(int argc, char *argv[]) {
-    // Optimización de salida
     setbuf(stdout, NULL);
 
     const char* filename = "./users.txt"; 
@@ -482,17 +461,12 @@ int main(int argc, char *argv[]) {
 
     file = fopen(filename, "r");
     if (file == NULL) {
-        fprintf(stderr, "Error abriendo archivo %s\n", filename);
-        return EXIT_FAILURE;
+        return 1;
     }
 
     HANDLE *hilos = (HANDLE *)malloc(sizeof(HANDLE) * threads_amount);
     struct ThreadData *datos_hilos = (struct ThreadData *)malloc(sizeof(struct ThreadData) * threads_amount);
     DWORD threadId;
-
-    printf("=== Iniciando Cracker (Version Universal) ===\n");
-    printf("PID del proceso: %lu\n", (unsigned long)GetCurrentProcessId());
-    printf("[Main] Esperando a que terminen los hilos...\n");
 
     for (int i = 0; i < threads_amount; i++) {
         datos_hilos[i].id = i + 1;
@@ -508,8 +482,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < threads_amount; i++) {
         hilos[i] = CreateThread(NULL, 0, thread_function, &datos_hilos[i], 0, &threadId);
         if (hilos[i] == NULL) {
-            fprintf(stderr, "Error creando hilo %d\n", i);
-            exit(EXIT_FAILURE);
+            exit(1);
         }
     }
 
@@ -517,9 +490,6 @@ int main(int argc, char *argv[]) {
 
     WaitForMultipleObjects(threads_amount, hilos, TRUE, INFINITE);
 
-    printf("\n[Main] Todos los hilos han terminado.\n");
-
-    // Limpieza
     for (int i = 0; i < threads_amount; i++) {
         CloseHandle(hilos[i]);
         CloseHandle(datos_hilos[i].semaphore);
